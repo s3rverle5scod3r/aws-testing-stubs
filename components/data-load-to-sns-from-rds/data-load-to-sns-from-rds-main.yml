@@ -1,0 +1,303 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: SAM CloudFormation deployment template for IaC services required for microservices component. For deployment to stage only to allow for load testing.
+
+Parameters:
+  Alias:
+    Type: String
+    Default: s3rverle5scod3r
+  
+  #Environment
+  Environment:
+    Type: String
+    Default: stage
+    AllowedValues:
+      - stage
+
+  #Version, to be supplied in format : {release}.{major}.{minor} (0.0.1)
+  Version:
+    Type: String
+
+Mappings:
+  # Lambda log output severity level, where:
+  # 1: DEBUG (display any severity)
+  # 2: INFO (ignore debug)
+  # 3: WARNING (ignore info and prior)
+  # 4: ERROR (ignore warning and prior)
+  LambdaLogLevelToEnvironment:
+    Environment:
+      STAGE: 1
+    
+  # Lambda RDS password ciphertext
+  LambdaRdsPasswordCipherToEnvironment:
+    Environment:
+      STAGE: tbc
+
+  #KMS key per environment for encryption/decryption
+  KmsKeyArnToEnvironment:
+    # example format : arn:aws:kms:{Region}:{AccountId}:key/{KeyId}
+    Environment:
+      stage: tbc
+
+Conditions:
+  EnvironmentIsProd: !Equals [ !Ref Environment, prod ]
+  EnvironmentIsStageOrProd: !Or [ !Equals [ !Ref Environment, stage ], !Equals [ !Ref Environment, prod ] ]
+
+Resources:
+  # Lambda Function
+  Lambda:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      FunctionName: !Sub '${Environment}-data-load-to-sns-from-rds-lambda-function'
+      CodeUri: bin/Release/net8.0/publish
+      Handler: data-load-to-sns-from-rds::aws_testing_stubs.data_load_to_sns_from_rds.Function::FunctionHandler
+      Runtime: dotnet8
+      Description: Reads from sql server rds table and writes found records to the relevant sns topic.
+      MemorySize: 256
+      Timeout: 60
+      Role: !GetAtt LambdaRole.Arn
+      KmsKeyArn: !FindInMap [ "KmsKeyArnToEnvironment", "Environment", !Ref Environment ]
+      VpcConfig:
+        SecurityGroupIds:
+          - sg-xxxxxx
+          - sg-yyyyyy
+        SubnetIds:
+          - subnet-1234c567
+      EventInvokeConfig:
+        MaximumRetryAttempts: 2
+      DeadLetterQueue:
+        Type: SNS
+        TargetArn: !Ref DlqTopic
+      Environment:
+        Variables:
+            ENVIRONMENT: !Ref Environment
+            LOG_LEVEL: !FindInMap [ LambdaLogLevelToEnvironment, Environment, !Ref Environment ]
+            RDS_DB_NAME: !Sub 'tbc_${Environment}'
+            RDS_HOSTNAME: tbc
+            RDS_PASSWORD: !FindInMap [ LambdaRdsPasswordCipherToEnvironment, Environment, !Ref Environment ]
+            RDS_USERNAME: !Sub 'tbc_lambda_${Environment}'
+            SUBMISSION_TOPIC_ARN: !Sub 'arn:aws:sns:eu-west-1:514253165353:${Environment}-sns-submission-topic'
+            FAILURE_TOPIC_ARN: !Ref DlqTopic
+      ReservedConcurrentExecutions: 1
+      Tags:
+        Alias: !Ref Alias
+        Environment: !Ref Environment
+        Version: !Sub '${VERSION}'
+
+  # Lambda cloudwatch log group
+  LambdaLogGroup: 
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName: !Sub "/aws/lambda/${Lambda}"
+      RetentionInDays: 365
+
+  EventbridgeSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${Environment}-data-load-to-sns-from-rds-eventbridge-rule-schedule'
+      Description: Eventbridge rule schedule for data-load-to-sns-from-rds lambda.
+      ScheduleExpression: cron(0 12 ? * * *) # use https://crontab.cronhub.io/ to validate cron expression
+      State: ENABLED
+      Targets:
+        - Arn: !Ref Lambda
+          Id: "LambdaFunction"
+
+  LambdaPermissionForEventsToInvokeLambda:
+      Type: AWS::Lambda::Permission
+      Properties:
+        FunctionName: !Ref Lambda
+        Action: 'lambda:InvokeFunction'
+        Principal: 'events.amazonaws.com'
+        SourceArn: !GetAtt EventbridgeSchedule.Arn
+
+  # Role for Lambda
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties: 
+      AssumeRolePolicyDocument: {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Principal": {
+              "Service": "lambda.amazonaws.com"
+            },
+            "Action": "sts:AssumeRole"
+          }
+        ]
+      }
+      Policies:
+        - PolicyName: !Sub '${Environment}-data-load-to-sns-from-rds-policy'
+          PolicyDocument: {
+            "Version": "2012-10-17",
+            "Statement": [
+            {
+              # Basic permissions for Lambda execution
+              "Sid": "ExecutionPerms",
+              "Effect": "Allow",
+              "Action": [
+                "logs:CreateLogGroup",
+                "logs:CreateLogStream",
+                "logs:PutLogEvents",
+                "ec2:CreateNetworkInterface",
+                "ec2:DeleteNetworkInterface",
+                "ec2:DescribeNetworkInterfaces",
+                "sns:Publish"
+              ],
+              "Resource": "*"
+            },
+            {
+              # Allow kms key useage
+              "Sid": "KmsPerms",
+              "Effect": "Allow",
+              "Action": [
+                "kms:Encrypt",
+                "kms:Decrypt",
+                "kms:ReEncrypt*",
+                "kms:GenerateDataKey",
+                "kms:DescribeKey"
+              ],
+              "Resource": "*"                            
+            },
+            {
+              # Allow message retrieval from sqs
+              "Sid": "SQSPerms",
+              "Effect": "Allow",
+              "Action": [
+                "sqs:ReceiveMessage",
+                "sqs:DeleteMessage",
+                "sqs:GetQueueAttributes"
+              ],
+              "Resource": "*"
+            },
+            {
+                # Allow publishing of notifications to sns topic
+                "Sid": "SnsPerms",
+                "Effect": "Allow",
+                "Action": [
+                    "sns:Publish"
+                ],
+                "Resource": "*"
+            }
+          ]
+        }
+      Description: Role for stubbed services Lambda.
+      RoleName: !Sub '${Environment}-data-load-to-sns-from-rds-role'
+
+  # Sns Topic
+  DlqTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      KmsMasterKeyId: !FindInMap [ "KmsKeyArnToEnvironment", "Environment", !Ref Environment ]
+      Tags: 
+      - Key: Alias
+        Value: !Ref Alias
+      - Key: Environment
+        Value: !Ref Environment
+      - Key: Version
+        Value: !Sub '${Version}'
+      TopicName: !Sub '${Environment}-data-load-to-sns-from-rds-sns-dlq-topic'
+
+  # Sns Topic Policy
+  DlqTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties: 
+      PolicyDocument: {
+        "Version": "2012-10-17",
+        "Id": "__default_policy_ID",
+        "Statement": [
+          {
+            # Allow account access
+            "Sid": "DefaultPerms",
+            "Effect": "Allow",
+            "Principal": {
+              "AWS": "*" 
+            },
+            "Action": [
+              "SNS:GetTopicAttributes",
+              "SNS:SetTopicAttributes",
+              "SNS:AddPermission",
+              "SNS:RemovePermission",
+              "SNS:DeleteTopic",
+              "SNS:Subscribe",
+              "SNS:ListSubscriptionsByTopic",
+              "SNS:Publish",
+              "SNS:Receive"
+            ],
+            "Resource": {
+              "Ref": "DlqTopic"
+            },
+            "Condition": {
+              "StringEquals": {
+                "AWS:SourceOwner": "{AccountId}"
+              }
+            }
+          }                                                   
+        ]                                           
+      }
+    Topics: 
+      - !Ref DlqTopic
+
+  # Subscription of the sqs queue to the sns topic
+  SnsSubscription:
+      Type: AWS::SNS::Subscription
+      Properties: 
+          Endpoint: !GetAtt DlqSqsQueue.Arn
+          Protocol: sqs
+          TopicArn: !Ref DlqTopic
+
+  # End user subscription email notifications - only create on prod/stage stacks
+  SnsSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: EnvironmentIsStageOrProd
+    Properties:
+      Protocol: email
+      Endpoint: !If [ EnvironmentIsProd, "user-a@domain.com", "user-b@domain.com" ]
+      TopicArn: !Ref DlqTopic
+
+  # Sqs queue
+  DlqSqsQueue:
+    Type: AWS::SQS::Queue
+    Properties: 
+      DelaySeconds: 0
+      KmsDataKeyReusePeriodSeconds: 300
+      KmsMasterKeyId: !FindInMap [ "KmsKeyArnToEnvironment", "Environment", !Ref Environment ]
+      MaximumMessageSize: 262144
+      MessageRetentionPeriod: 345600
+      QueueName: !Sub '${Environment}-data-load-to-sns-from-rds-sqs-queue'
+      ReceiveMessageWaitTimeSeconds: 0
+      Tags: 
+        - Key: Alias
+          Value: !Ref Alias
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Version
+          Value: !Sub '${Version}'
+      VisibilityTimeout: 60
+
+  # Sqs queue policy
+  SqsQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties: 
+      PolicyDocument: {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            # Allow sqs to send messages from subscribed sns topic to sqs queue
+            "Sid": "SnsPerms",
+            "Effect": "Allow",
+            "Principal": {
+              "Service": "sns.amazonaws.com"
+            },
+            "Action": "sqs:SendMessage",
+            "Resource": {"Fn::GetAtt": [ "DlqSqsQueue", "Arn" ] },
+            "Condition": {
+              "ArnEquals": {
+                "aws:SourceArn": {"Ref": "DlqTopic"}
+              }
+            }
+          }
+        ]
+      }
+    Queues: 
+      - !Sub 'https://sqs.{Region}.amazonaws.com/{AccountId}/${Environment}-data-load-to-sns-from-rds-sqs-queue'
